@@ -8,8 +8,10 @@ use crate::{PointerPosition, ScreenSize};
 use std::cell::RefCell;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    Atom, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask,
+    Atom, AtomEnum, Bool32, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
+    ConnectionExt, EventMask, PropMode, StackMode,
 };
+use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
 thread_local! {
@@ -146,6 +148,9 @@ pub fn set_skip_taskbar(window_id: u32, skip: bool) -> bool {
 /// GTK4 不追踪 `_NET_WM_STATE`（相关类型化方法已移除），窗口管理器在重新评估窗口时
 /// 可能把整窗口状态清掉，于是"置顶丢了、任务栏图标又回来"会间歇性出现。把多个变更
 /// 合并到同一次连接里发送，并且由调用方周期性重申（见 gui.rs），即可自愈。
+///
+/// 同时把窗口类型设为 dock（面板）：dock 在绝大多数窗口管理器（KWin/dde-kwin、Mutter…）
+/// 里处于比全屏窗口更高的层，这样即使是"无边框全屏"的游戏也不会盖住宠物。
 pub fn apply_states(window_id: u32, above: bool) -> bool {
     with_connection(|connection, _screen_number| -> Option<()> {
         let net_wm_state = intern_atom(connection, b"_NET_WM_STATE")?;
@@ -177,6 +182,65 @@ pub fn apply_states(window_id: u32, above: bool) -> bool {
             )
             .ok()?;
 
+        // 3) dock 类型：让 WM 把它放进比全屏更高的层（见 set_dock）
+        set_dock_property(connection, window_id)?;
+
+        connection.flush().ok()?;
+        Some(())
+    })
+    .is_some()
+}
+
+/// 把窗口类型设为 dock（面板）。只改属性，不预留屏幕边距（不设 strut）。
+fn set_dock_property(connection: &RustConnection, window_id: u32) -> Option<()> {
+    let net_wm_window_type = intern_atom(connection, b"_NET_WM_WINDOW_TYPE")?;
+    let dock = intern_atom(connection, b"_NET_WM_WINDOW_TYPE_DOCK")?;
+    connection
+        .change_property32(
+            PropMode::REPLACE,
+            window_id,
+            net_wm_window_type,
+            AtomEnum::ATOM,
+            &[dock],
+        )
+        .ok()?;
+    Some(())
+}
+
+/// 把窗口抬到同层其它窗口之上（ConfigureWindow stack_mode=Above）。
+///
+/// 配合 `_NET_WM_STATE_ABOVE` + dock 类型使用：dock 之上若还有其它 dock/面板，
+/// 或 WM 重新评估过堆叠顺序，这里能再抢一次最上层。
+pub fn raise(window_id: u32) -> bool {
+    with_connection(|connection, _screen_number| -> Option<()> {
+        connection
+            .configure_window(window_id, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))
+            .ok()?;
+        connection.flush().ok()?;
+        Some(())
+    })
+    .is_some()
+}
+
+/// 设置窗口的 `override_redirect` 标志（X11 绕过窗口管理器）。
+///
+/// 必须在窗口**映射之前**调用（即 GTK `realize()` 之后、`present()` 之前），窗口管理器
+/// 才会在映射时把它当作不受管辖的窗口 —— 永远画在受管窗口（含全屏游戏）之上，
+/// 等价于 PyQt 的 `Qt.WindowType.X11BypassWindowManagerHint`。
+///
+/// 映射之后再改这个标志无效，所以这里只负责设置，是否真正生效由调用方在映射前决定。
+pub fn set_override_redirect(window_id: u32, enable: bool) -> bool {
+    with_connection(|connection, _screen_number| -> Option<()> {
+        connection
+            .change_window_attributes(
+                window_id,
+                &ChangeWindowAttributesAux::new().override_redirect(Some(if enable {
+                    Bool32::from(1u32)
+                } else {
+                    Bool32::from(0u32)
+                })),
+            )
+            .ok()?;
         connection.flush().ok()?;
         Some(())
     })

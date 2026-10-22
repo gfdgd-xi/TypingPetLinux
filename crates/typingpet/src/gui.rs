@@ -93,6 +93,10 @@ struct UiState {
     wayland_note_printed: bool,
     /// X11 下窗口刚映射时会被窗口管理器摆到别处，前若干帧反复重申目标位置。
     x11_settle_frames: u8,
+    /// X11 下是否用 override-redirect 绕过窗口管理器（参考 PyQt 的
+    /// `X11BypassWindowManagerHint`）。开启后窗口不受 WM 管辖，可压住全屏游戏；
+    /// 此时 `_NET_WM_STATE` 等 WM 钩子全部失效。
+    x11_override_redirect: bool,
 }
 
 impl UiState {
@@ -346,6 +350,7 @@ impl PetUi {
             avoid_settled: true,
             wayland_note_printed: false,
             x11_settle_frames: if wayland_display() { 0 } else { 30 },
+            x11_override_redirect: false,
         }));
 
         let ui = Rc::new(Self {
@@ -411,13 +416,35 @@ impl PetUi {
                  建议去掉 GDK_BACKEND=x11，改用原生 Wayland 后端。"
             );
         }
+        // X11 普通窗口：在 present() 映射之前把 surface 设为 override-redirect，
+        // 这样窗口管理器不会接管它（等价 PyQt 的 X11BypassWindowManagerHint），
+        // 即使全屏游戏也盖不住宠物。映射之后再设置无效，所以必须放在 present() 之前。
+        let x11_override = if !layer_shell {
+            gtk4::prelude::WidgetExt::realize(&window);
+            if let Some(window_id) = x11_window_id(&window) {
+                let ok = typingpet_input::x11::set_override_redirect(window_id, true);
+                if ok {
+                    println!("X11: 已设为 override-redirect（绕过窗口管理器，可压住全屏游戏）");
+                } else {
+                    eprintln!("X11: 设置 override-redirect 失败，回退到 _NET_WM_STATE 方案");
+                }
+                ok
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        ui.state.borrow_mut().x11_override_redirect = x11_override;
+
         window.present();
 
-        // X11 普通窗口：present 之后才能可靠地让窗口管理器接受这些 _NET_WM_STATE。
-        // GTK4 不追踪该状态，窗口管理器重新评估窗口时可能整窗清掉，所以：
+        // X11 普通窗口（非 override-redirect）：present 之后才能可靠地让窗口管理器接受
+        // 这些 _NET_WM_STATE。GTK4 不追踪该状态，窗口管理器重新评估窗口时可能整窗清掉，所以：
         //   1) 启动时先应用一次；
-        //   2) 之后由下方定时器周期性重申（见后），被清掉也能在 2s 内自愈。
-        if !layer_shell {
+        //   2) 之后由下方定时器周期性重申（见后），被清掉也能在 1s 内自愈。
+        // override-redirect 窗口不受 WM 管辖，这些钩子无意义，跳过。
+        if !layer_shell && !x11_override {
             if let Some(window_id) = x11_window_id(&window) {
                 let above = ui.state.borrow().settings.always_on_top;
                 if !typingpet_input::x11::apply_states(window_id, above) {
@@ -426,15 +453,17 @@ impl PetUi {
             }
         }
 
-        // 周期性重申 X11 窗口状态：自愈"置顶丢失 / 任务栏图标回来"的间歇问题。
-        // 仅在非 layer-shell 且窗口可见时生效；Wayland 下 x11_window_id 返回 None，空转无害。
+        // 周期性重申 X11 窗口状态：自愈"置顶丢失 / 任务栏图标回来"的间歇问题，
+        // 并不断抬到最上层以压住无边框全屏的游戏。仅在非 layer-shell、非 override-redirect、
+        // 且窗口可见时生效；override-redirect 与 Wayland 下为空转。
         {
             let ui = ui.clone();
-            gtk::glib::timeout_add_seconds_local(2, move || {
-                if ui.window.is_visible() {
+            gtk::glib::timeout_add_seconds_local(1, move || {
+                if !ui.state.borrow().x11_override_redirect && ui.window.is_visible() {
                     if let Some(window_id) = x11_window_id(&ui.window) {
                         let above = ui.state.borrow().settings.always_on_top;
                         typingpet_input::x11::apply_states(window_id, above);
+                        typingpet_input::x11::raise(window_id);
                     }
                 }
                 gtk::glib::ControlFlow::Continue
@@ -637,11 +666,16 @@ impl PetUi {
             };
             self.window.set_layer(layer);
         } else if let Some(window_id) = x11_window_id(&self.window) {
+            if self.state.borrow().x11_override_redirect {
+                // override-redirect 窗口恒为最顶层，不受 WM 管辖，置顶切换无意义，忽略。
+                return;
+            }
             // X11 普通窗口没有 layer-shell，直接用 _NET_WM_STATE 让窗口管理器置顶，
-            // 同时重申跳过任务栏（两者合并发送，避免切换置顶把"隐藏任务栏"带丢）。
+            // 同时重申跳过任务栏+设为 dock 类型（两者合并发送，避免切换置顶把"隐藏任务栏"带丢）。
             if !typingpet_input::x11::apply_states(window_id, enabled) {
                 eprintln!("X11: 设置置顶失败（id=0x{window_id:x}）");
             }
+            typingpet_input::x11::raise(window_id);
         }
     }
 
@@ -1782,6 +1816,7 @@ mod tests {
             avoid_settled: true,
             wayland_note_printed: false,
             x11_settle_frames: 0,
+            x11_override_redirect: false,
         }
     }
 
@@ -1893,6 +1928,7 @@ mod tests {
             avoid_settled: true,
             wayland_note_printed: false,
             x11_settle_frames: 0,
+            x11_override_redirect: false,
         };
         let frame = state.pet_frame();
         assert_eq!(frame.x, 140.0);
