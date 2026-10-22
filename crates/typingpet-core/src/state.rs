@@ -195,7 +195,7 @@ impl PetState {
         Vec::new()
     }
 
-    /// 选图：精确规则 > 同时按两键(exclamation) > 单键按顺序轮播。
+    /// 选图：精确规则 > 同时按 >=2 键(exclamation) > 单键按顺序轮播。
     fn choose_image(
         &mut self,
         stroke: Option<KeyStroke>,
@@ -213,11 +213,13 @@ impl PetState {
             return Some(rule_image);
         }
 
-        // 2) 与上一次按下间隔极短且键码不同 → 视为同时按两键
+        // 2) 与"上一次按下"间隔极短且键码不同 → 视为同时按多个键（和弦）。
+        //    判定为 >= 2 个键同时按即切换到 exclamation，不仅限于成对：
+        //    不清空 last_press，让第 2、3、… 个同和弦键都触发 exclamation。
         if let Some((last_code, last_time)) = self.last_press {
             if last_code != stroke.code && now - last_time <= SIMULTANEOUS_WINDOW {
                 if let Some(exclamation) = &self.exclamation_url {
-                    self.last_press = None; // 消费这一对，避免后续串接
+                    self.last_press = Some((stroke.code, now));
                     return Some(exclamation.clone());
                 }
             }
@@ -517,6 +519,29 @@ mod tests {
         let actions = state.on_key(Some(second), &rules, &mut rng, 1.02);
         assert_eq!(
             actions[0],
+            Action::ShowImage(PathBuf::from("/img/pet-exclamation.png"))
+        );
+    }
+
+    #[test]
+    fn three_or_more_simultaneous_keys_all_show_exclamation() {
+        let mut state = chord_state();
+        state.initial_actions();
+        let rules = KeyReactionStore::new("/nonexistent-rules");
+        let mut rng = FixedRng(0);
+        let a = KeyStroke::new(37, crate::keys::KeyModifiers::empty());
+        let b = KeyStroke::new(38, crate::keys::KeyModifiers::empty());
+        let c = KeyStroke::new(39, crate::keys::KeyModifiers::empty());
+        // 第一个键：普通反应（left）
+        state.on_key(Some(a), &rules, &mut rng, 1.0);
+        // 第二个键（同时按）→ exclamation
+        assert_eq!(
+            state.on_key(Some(b), &rules, &mut rng, 1.01)[0],
+            Action::ShowImage(PathBuf::from("/img/pet-exclamation.png"))
+        );
+        // 第三个键（仍视为同时按的和弦）→ 也 exclamation（>= 2 键均触发）
+        assert_eq!(
+            state.on_key(Some(c), &rules, &mut rng, 1.02)[0],
             Action::ShowImage(PathBuf::from("/img/pet-exclamation.png"))
         );
     }
