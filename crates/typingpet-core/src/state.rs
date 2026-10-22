@@ -3,10 +3,17 @@
 //! 这一层刻意不依赖任何 GUI/输入实现，便于 headless 全链路验证。
 
 use crate::keys::{KeyReactionStore, KeyStroke};
-use crate::picker::{ImagePicker, Rng};
-use std::path::PathBuf;
+use crate::picker::Rng;
+use std::path::{Path, PathBuf};
 
 pub const IDLE_DELAY: f64 = 0.75;
+
+/// 判定"同时按两个键"的时间窗（秒）。
+///
+/// 输入层只上报"按下"事件（自动重复已过滤），无法区分键的物理按住状态，
+/// 因此用两次按下之间的时间差近似：间隔小于此阈值且键码不同，即视为同时按下。
+/// 普通打字两键之间通常 > 100ms，而真正同时按下的两键间隔 < 10ms，40ms 足够区分。
+const SIMULTANEOUS_WINDOW: f64 = 0.04;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -19,11 +26,28 @@ pub enum Action {
 #[derive(Debug)]
 pub struct PetState {
     idle_url: Option<PathBuf>,
+    /// 所有反应图（含 exclamation），仅用于计数/兼容。
     reaction_urls: Vec<PathBuf>,
+    /// 单键轮播池：除 exclamation 之外的反应图，按 left→right→left→right 顺序循环。
+    sequence_urls: Vec<PathBuf>,
+    /// 文件名含 "exclamation" 的图，仅在同时按两个键时显示。
+    exclamation_url: Option<PathBuf>,
+    /// 轮播池当前下标（每次单键按下前进一位）。
+    sequence_index: usize,
+    /// 上一次按下事件：键码 + 时间戳，用于"同时按两键"判定。
+    last_press: Option<(u32, f64)>,
     current_image: Option<PathBuf>,
     idle_deadline: Option<f64>,
     shake_amplitude: f64,
     reaction_count: usize,
+}
+
+/// 文件名（stem，大小写不敏感）是否含 "exclamation"。
+fn is_exclamation(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_lowercase().contains("exclamation"))
+        .unwrap_or(false)
 }
 
 impl PetState {
@@ -32,10 +56,15 @@ impl PetState {
         reaction_urls: Vec<PathBuf>,
         shake_amplitude: f64,
     ) -> Self {
+        let (sequence_urls, exclamation_url) = split_reactions(&reaction_urls);
         Self {
             reaction_count: reaction_urls.len(),
             idle_url,
             reaction_urls,
+            sequence_urls,
+            exclamation_url,
+            sequence_index: 0,
+            last_press: None,
             current_image: None,
             idle_deadline: None,
             shake_amplitude,
@@ -48,9 +77,14 @@ impl PetState {
         reaction_urls: Vec<PathBuf>,
         shake_amplitude: f64,
     ) {
+        let (sequence_urls, exclamation_url) = split_reactions(&reaction_urls);
         self.reaction_count = reaction_urls.len();
         self.idle_url = idle_url;
         self.reaction_urls = reaction_urls;
+        self.sequence_urls = sequence_urls;
+        self.exclamation_url = exclamation_url;
+        self.sequence_index = 0;
+        self.last_press = None;
         self.shake_amplitude = shake_amplitude;
         self.current_image = None;
         self.idle_deadline = None;
@@ -87,21 +121,15 @@ impl PetState {
         actions
     }
 
-    /// 键输入处理。`stroke` 为 `None` 时表示"测试按钮"（跳过精确规则匹配）。
+    /// 键输入处理。`stroke` 为 `None` 时表示"测试按钮"，按单键逻辑轮播。
     pub fn on_key(
         &mut self,
         stroke: Option<KeyStroke>,
         rules: &KeyReactionStore,
-        rng: &mut impl Rng,
+        _rng: &mut impl Rng,
         now: f64,
     ) -> Vec<Action> {
-        let chosen = match stroke {
-            Some(stroke) => match rules.image_path(stroke) {
-                Some(path) => Some(path),
-                None => self.pick_random(rng),
-            },
-            None => self.pick_random(rng),
-        };
+        let chosen = self.choose_image(stroke, rules, now);
 
         let Some(chosen) = chosen else {
             return Vec::new();
@@ -115,6 +143,49 @@ impl PetState {
         }
         self.idle_deadline = Some(now + IDLE_DELAY);
         actions
+    }
+
+    /// 选图：精确规则 > 同时按两键(exclamation) > 单键按顺序轮播。
+    fn choose_image(
+        &mut self,
+        stroke: Option<KeyStroke>,
+        rules: &KeyReactionStore,
+        now: f64,
+    ) -> Option<PathBuf> {
+        let Some(stroke) = stroke else {
+            // 测试按钮：按单键逻辑轮播下一张
+            return self.next_sequence();
+        };
+
+        // 1) 精确规则优先
+        if let Some(rule_image) = rules.image_path(stroke) {
+            self.last_press = Some((stroke.code, now));
+            return Some(rule_image);
+        }
+
+        // 2) 与上一次按下间隔极短且键码不同 → 视为同时按两键
+        if let Some((last_code, last_time)) = self.last_press {
+            if last_code != stroke.code && now - last_time <= SIMULTANEOUS_WINDOW {
+                if let Some(exclamation) = &self.exclamation_url {
+                    self.last_press = None; // 消费这一对，避免后续串接
+                    return Some(exclamation.clone());
+                }
+            }
+        }
+        self.last_press = Some((stroke.code, now));
+
+        // 3) 普通单键：按 left→right→left→right 顺序轮播
+        self.next_sequence()
+    }
+
+    /// 轮播下一张：依次取 sequence_urls[sequence_index]，然后下标前进。
+    fn next_sequence(&mut self) -> Option<PathBuf> {
+        if self.sequence_urls.is_empty() {
+            return None;
+        }
+        let path = self.sequence_urls[self.sequence_index % self.sequence_urls.len()].clone();
+        self.sequence_index = (self.sequence_index + 1) % self.sequence_urls.len();
+        Some(path)
     }
 
     /// 定时推进：超时后回待机。
@@ -136,22 +207,26 @@ impl PetState {
         self.current_image = Some(idle.clone());
         vec![Action::ShowImage(idle)]
     }
+}
 
-    fn pick_random(&self, rng: &mut impl Rng) -> Option<PathBuf> {
-        let names: Vec<String> = self
-            .reaction_urls
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect();
-        let picker = ImagePicker::new(names);
-        let current_key = self
-            .current_image
-            .as_ref()
-            .map(|path| path.to_string_lossy().to_string());
-        picker
-            .next_excluding(current_key.as_deref(), rng)
-            .map(PathBuf::from)
-    }
+/// 把反应图拆成"轮播池"与"exclamation（双键）"。
+fn split_reactions(urls: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>) {
+    let mut exclamation: Option<PathBuf> = None;
+    let sequence: Vec<PathBuf> = urls
+        .iter()
+        .filter(|path| {
+            if is_exclamation(path) {
+                if exclamation.is_none() {
+                    exclamation = Some((*path).clone());
+                }
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+    (sequence, exclamation)
 }
 
 #[cfg(test)]
@@ -264,5 +339,72 @@ mod tests {
         let mut rng = FixedRng(0);
         let actions = state.on_key(None, &rules, &mut rng, 0.0);
         assert_eq!(actions.len(), 1);
+    }
+
+    /// 默认反应集：left/right 轮播，exclamation 留给双键。
+    fn chord_state() -> PetState {
+        PetState::new(
+            Some(PathBuf::from("/img/pet-idle.png")),
+            vec![
+                PathBuf::from("/img/pet-left.png"),
+                PathBuf::from("/img/pet-right.png"),
+                PathBuf::from("/img/pet-exclamation.png"),
+            ],
+            9.0,
+        )
+    }
+
+    #[test]
+    fn single_key_cycles_left_right_in_order() {
+        let mut state = chord_state();
+        state.initial_actions();
+        let rules = KeyReactionStore::new("/nonexistent-rules");
+        let mut rng = FixedRng(0);
+        let stroke = KeyStroke::new(37, crate::keys::KeyModifiers::empty());
+        let expected_order = [
+            PathBuf::from("/img/pet-left.png"),
+            PathBuf::from("/img/pet-right.png"),
+            PathBuf::from("/img/pet-left.png"),
+            PathBuf::from("/img/pet-right.png"),
+        ];
+        for expected in expected_order {
+            let actions = state.on_key(Some(stroke), &rules, &mut rng, 1.0);
+            assert_eq!(actions[0], Action::ShowImage(expected));
+        }
+    }
+
+    #[test]
+    fn two_simultaneous_keys_show_exclamation() {
+        let mut state = chord_state();
+        state.initial_actions();
+        let rules = KeyReactionStore::new("/nonexistent-rules");
+        let mut rng = FixedRng(0);
+        let first = KeyStroke::new(37, crate::keys::KeyModifiers::empty());
+        let second = KeyStroke::new(38, crate::keys::KeyModifiers::empty());
+        // 第一个键：普通反应（left），并记录时间戳
+        state.on_key(Some(first), &rules, &mut rng, 1.0);
+        // 极短时间内第二个不同键：视为同时按下 → exclamation
+        let actions = state.on_key(Some(second), &rules, &mut rng, 1.02);
+        assert_eq!(
+            actions[0],
+            Action::ShowImage(PathBuf::from("/img/pet-exclamation.png"))
+        );
+    }
+
+    #[test]
+    fn not_simultaneous_when_keys_are_far_apart() {
+        let mut state = chord_state();
+        state.initial_actions();
+        let rules = KeyReactionStore::new("/nonexistent-rules");
+        let mut rng = FixedRng(0);
+        let first = KeyStroke::new(37, crate::keys::KeyModifiers::empty());
+        let second = KeyStroke::new(38, crate::keys::KeyModifiers::empty());
+        state.on_key(Some(first), &rules, &mut rng, 1.0);
+        // 200ms 后按下：远超同时判定窗，仍按单键轮播（right）
+        let actions = state.on_key(Some(second), &rules, &mut rng, 1.20);
+        assert_eq!(
+            actions[0],
+            Action::ShowImage(PathBuf::from("/img/pet-right.png"))
+        );
     }
 }

@@ -7,7 +7,9 @@
 use crate::{PointerPosition, ScreenSize};
 use std::cell::RefCell;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt};
+use x11rb::protocol::xproto::{
+    Atom, ClientMessageEvent, ConfigureWindowAux, ConnectionExt, EventMask,
+};
 use x11rb::rust_connection::RustConnection;
 
 thread_local! {
@@ -84,6 +86,69 @@ pub fn move_window(window_id: u32, x: i32, y: i32) -> bool {
             && connection.flush().is_ok()
     })
     .unwrap_or(false)
+}
+
+/// 让窗口管理器把窗口置于最上层（X11 的 `_NET_WM_STATE_ABOVE`）。
+///
+/// 这是 layer-shell 之外，在普通 X11 会话里实现"置顶"的唯一办法。
+/// 通过发送 `_NET_WM_STATE` ClientMessage 给窗口，由窗口管理器代为设置状态，
+/// 因此 `above=false` 时只是撤销置顶（不影响窗口原本的层级）。
+pub fn set_above(window_id: u32, above: bool) -> bool {
+    with_connection(|connection, _screen_number| -> Option<()> {
+        let net_wm_state = intern_atom(connection, b"_NET_WM_STATE")?;
+        let net_wm_state_above = intern_atom(connection, b"_NET_WM_STATE_ABOVE")?;
+
+        // data[0]: 动作（1=ADD, 0=REMOVE）；data[1]: 要切换的状态原子
+        let data = [if above { 1 } else { 0 }, net_wm_state_above, 0, 0, 0];
+        let event = ClientMessageEvent::new(32, window_id, net_wm_state, data);
+        connection
+            .send_event(
+                true,
+                window_id,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .ok()?;
+        connection.flush().ok()?;
+        Some(())
+    })
+    .is_some()
+}
+
+/// 让窗口管理器把窗口从任务栏/分页器里隐藏（X11 的 `_NET_WM_STATE_SKIP_TASKBAR` / `SKIP_PAGER`）。
+///
+/// GTK4 已移除 `skip-taskbar-hint` 属性，普通 X11 窗口只能直接发 `_NET_WM_STATE` ClientMessage。
+pub fn set_skip_taskbar(window_id: u32, skip: bool) -> bool {
+    with_connection(|connection, _screen_number| -> Option<()> {
+        let net_wm_state = intern_atom(connection, b"_NET_WM_STATE")?;
+        let skip_taskbar = intern_atom(connection, b"_NET_WM_STATE_SKIP_TASKBAR")?;
+        let skip_pager = intern_atom(connection, b"_NET_WM_STATE_SKIP_PAGER")?;
+
+        // data[0]: 动作（1=ADD, 0=REMOVE）；data[1..2]: 要切换的状态原子
+        let data = [if skip { 1 } else { 0 }, skip_taskbar, skip_pager, 0, 0];
+        let event = ClientMessageEvent::new(32, window_id, net_wm_state, data);
+        connection
+            .send_event(
+                true,
+                window_id,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .ok()?;
+        connection.flush().ok()?;
+        Some(())
+    })
+    .is_some()
+}
+
+/// 取已 intern 的原子；失败返回 `None`。
+fn intern_atom(connection: &RustConnection, name: &[u8]) -> Option<Atom> {
+    connection
+        .intern_atom(false, name)
+        .ok()?
+        .reply()
+        .ok()
+        .map(|reply| reply.atom)
 }
 
 /// 读回窗口在 root 坐标系里的真实位置与尺寸（用于自检/日志）。

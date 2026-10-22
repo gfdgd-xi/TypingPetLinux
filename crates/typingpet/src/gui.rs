@@ -284,6 +284,9 @@ impl PetUi {
             .resizable(false)
             .title("TypingPet")
             .build();
+        // 桌宠是常驻小组件，不应在任务栏/分页器里出现图标。
+        // GTK4 已移除 skip-taskbar-hint 属性，X11 下改用 _NET_WM_STATE_SKIP_TASKBAR
+        // （见窗口 present 后的处理）；Wayland + layer-shell 本身不进任务栏。
         window.add_css_class("typingpet-window");
 
         install_css();
@@ -388,10 +391,18 @@ impl PetUi {
         }
         println!("提示：滚轮=缩放，拖拽=移动，托盘/设置窗口=全部功能");
         if !layer_shell {
-            println!(
-                "提示：当前未启用 layer-shell（会话={}），窗口不会置顶",
-                typingpet_input::session_kind()
-            );
+            if wayland_display() {
+                println!(
+                    "提示：当前未启用 layer-shell（会话={}），窗口不会置顶",
+                    typingpet_input::session_kind()
+                );
+            } else {
+                println!(
+                    "提示：当前未启用 layer-shell（会话={}），置顶由窗口管理器的 \
+                     _NET_WM_STATE_ABOVE 实现（托盘「置顶」可切换）",
+                    typingpet_input::session_kind()
+                );
+            }
         }
         if !wayland_display() && typingpet_input::session_kind() == "wayland" {
             println!(
@@ -401,6 +412,22 @@ impl PetUi {
             );
         }
         window.present();
+
+        // X11 普通窗口：present 之后才能可靠地让窗口管理器接受这些 _NET_WM_STATE。
+        if !layer_shell {
+            if let Some(window_id) = x11_window_id(&window) {
+                // 不在任务栏/分页器显示图标（GTK4 已移除对应属性）
+                if !typingpet_input::x11::set_skip_taskbar(window_id, true) {
+                    eprintln!("X11: 隐藏任务栏图标失败（id=0x{window_id:x}）");
+                }
+                // 若配置里已开启置顶，这里在启动时应用一次（后续由托盘「置顶」实时切换）。
+                if state.borrow().settings.always_on_top
+                    && !typingpet_input::x11::set_above(window_id, true)
+                {
+                    eprintln!("X11: 启动置顶失败（id=0x{window_id:x}）");
+                }
+            }
+        }
 
         // 恢复自检：启动 1 秒后打印窗口状态（含 X11 下的真实位置），
         // 以及 --dump-png 的离屏渲染。这两项在早先的一次重写里被误删过。
@@ -597,6 +624,11 @@ impl PetUi {
                 gtk4_layer_shell::Layer::Bottom
             };
             self.window.set_layer(layer);
+        } else if let Some(window_id) = x11_window_id(&self.window) {
+            // X11 普通窗口没有 layer-shell，只能用 _NET_WM_STATE_ABOVE 让窗口管理器置顶
+            if !typingpet_input::x11::set_above(window_id, enabled) {
+                eprintln!("X11: 设置置顶失败（id=0x{window_id:x}）");
+            }
         }
     }
 
@@ -1594,21 +1626,8 @@ fn resolve_position(
         _ => bottom_right,
     };
 
-    let clamped_x = requested.x.clamp(
-        monitor.x,
-        (monitor.x + monitor.width - size.w).max(monitor.x),
-    );
-    let clamped_y = requested.y.clamp(
-        monitor.y,
-        (monitor.y + monitor.height - size.h).max(monitor.y),
-    );
-    if (clamped_x - requested.x).abs() > 1.0 || (clamped_y - requested.y).abs() > 1.0 {
-        println!(
-            "position: 请求的 ({:.0},{:.0}) 超出显示器范围，已钳制到 ({:.0},{:.0})",
-            requested.x, requested.y, clamped_x, clamped_y
-        );
-    }
-    Point::new(clamped_x, clamped_y)
+    // 不做显示器范围钳制：即使坐标超出屏幕，也照原样定位（多屏/负坐标/临时拖出等场景）。
+    requested
 }
 
 fn attach_motion(window: &gtk::Window, ui: &Rc<PetUi>) {

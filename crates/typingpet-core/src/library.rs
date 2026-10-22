@@ -16,7 +16,6 @@ pub const DEFAULT_IDLE_NAME: &str = "pet-idle.png";
 pub const DEFAULT_REACTION_NAMES: &[&str] = &[
     "pet-left.png",
     "pet-right.png",
-    "pet-question.png",
     "pet-exclamation.png",
 ];
 
