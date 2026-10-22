@@ -659,8 +659,9 @@ impl PetUi {
     pub fn set_always_on_top(&self, enabled: bool) {
         self.update_settings(|settings| settings.always_on_top = enabled);
         if layer_shell_supported() {
+            // 置顶用 Overlay（最高层，压住任务栏/面板与全屏游戏）；取消置顶回 Bottom。
             let layer = if enabled {
-                gtk4_layer_shell::Layer::Top
+                gtk4_layer_shell::Layer::Overlay
             } else {
                 gtk4_layer_shell::Layer::Bottom
             };
@@ -1517,11 +1518,14 @@ fn setup_layer_shell(
     window.init_layer_shell();
     let layer = match requested_layer {
         "overlay" => gtk4_layer_shell::Layer::Overlay,
+        "top" => gtk4_layer_shell::Layer::Top,
         "bottom" => gtk4_layer_shell::Layer::Bottom,
         "background" => gtk4_layer_shell::Layer::Background,
         _ => {
+            // 置顶用 Overlay（layer-shell 最高层），可压住任务栏/面板与全屏游戏；
+            // 取消置顶则回到 Bottom（退到普通窗口之下）。
             if settings.always_on_top {
-                gtk4_layer_shell::Layer::Top
+                gtk4_layer_shell::Layer::Overlay
             } else {
                 gtk4_layer_shell::Layer::Bottom
             }
