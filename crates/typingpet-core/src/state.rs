@@ -6,7 +6,16 @@ use crate::keys::{KeyReactionStore, KeyStroke};
 use crate::picker::Rng;
 use std::path::{Path, PathBuf};
 
-pub const IDLE_DELAY: f64 = 0.75;
+/// 回到待机图的去抖窗口（秒）。
+///
+/// 仅用于避免"快速打字"时每次抬起都闪一下待机图：只要两次按键间隔小于本值，
+/// 宠物就保持在反应图；超过本值（即你停下打字）才切回待机图。本值刻意做得很小，
+/// 让停下打字后几乎立刻回待机，不再有旧版 0.75s 的拖沓感。
+pub const IDLE_DELAY: f64 = 0.2;
+
+/// 判定为"长按"的阈值（秒）。按住超过此时长的按键，松开后**立即**回待机图（不等
+/// `IDLE_DELAY`）；短于它的视作快速输入，保留 `IDLE_DELAY` 去抖。
+pub const HOLD_THRESHOLD: f64 = 0.3;
 
 /// 判定"同时按两个键"的时间窗（秒）。
 ///
@@ -43,6 +52,8 @@ pub struct PetState {
     /// 当前被按住（未抬起）的非修饰键数量。>0 时长按期间不回待机，
     /// 直到全部抬起才开始计时回待机图。
     held_count: usize,
+    /// 从"无键按住"进入"有键按住"的时刻，用于区分长按/短按。
+    held_since: Option<f64>,
 }
 
 /// 文件名（stem，大小写不敏感）是否含 "exclamation"。
@@ -72,6 +83,7 @@ impl PetState {
             idle_deadline: None,
             shake_amplitude,
             held_count: 0,
+            held_since: None,
         }
     }
 
@@ -93,6 +105,7 @@ impl PetState {
         self.current_image = None;
         self.idle_deadline = None;
         self.held_count = 0;
+        self.held_since = None;
     }
 
     pub fn current_image(&self) -> Option<&PathBuf> {
@@ -149,6 +162,10 @@ impl PetState {
         if self.shake_amplitude > 0.0 {
             actions.push(Action::Bounce(self.shake_amplitude));
         }
+        if self.held_count == 0 {
+            // 从"无键按住"进入"有键按住"：记录起始时刻，用于区分长按/短按
+            self.held_since = Some(now);
+        }
         self.held_count = self.held_count.saturating_add(1);
         self.idle_deadline = Some(now + IDLE_DELAY);
         actions
@@ -166,8 +183,15 @@ impl PetState {
         if self.held_count > 0 {
             return Vec::new();
         }
-        // 最后一个键松开：开始计时回待机
-        self.idle_deadline = Some(now + IDLE_DELAY);
+        // 最后一个键松开：根据按住时长决定回待机时机
+        let was_long_press = self
+            .held_since
+            .map(|start| now - start >= HOLD_THRESHOLD)
+            .unwrap_or(false);
+        self.held_since = None;
+        // 长按（按住较久）：松开后**立即**回待机，不等 0.75s；
+        // 短按/快速连打：保留 IDLE_DELAY 去抖，避免两次按键之间闪回待机图。
+        self.idle_deadline = Some(if was_long_press { now } else { now + IDLE_DELAY });
         Vec::new()
     }
 
@@ -304,16 +328,49 @@ mod tests {
         assert!(state.tick(200.0).is_empty());
         assert!(!state.is_showing_idle());
 
-        // 抬起后才开始计时回待机
+        // 抬起（长按：从 100.0 按住到 200.0）后应立即回待机，不等 0.75s
         state.on_key_up(None, 200.0);
-        assert!(state.tick(200.7).is_empty());
         assert_eq!(
-            state.tick(200.76),
+            state.tick(200.01),
             vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
         );
         assert!(state.is_showing_idle());
         // 已回待机后不再重复
         assert!(state.tick(201.0).is_empty());
+    }
+
+    #[test]
+    fn short_press_keeps_debounce_between_keys() {
+        let mut state = state();
+        state.initial_actions();
+        let rules = KeyReactionStore::new("/nonexistent-rules");
+        let mut rng = FixedRng(0);
+
+        // 短按：按下 0.0、抬起 0.1（< HOLD_THRESHOLD）→ 仅保留很短的去抖窗口
+        state.on_key(None, &rules, &mut rng, 0.0);
+        state.on_key_up(None, 0.1);
+        // 0.1 + IDLE_DELAY(0.2) = 0.3 之前不回待机
+        assert!(state.tick(0.2).is_empty());
+        assert_eq!(
+            state.tick(0.31),
+            vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
+        );
+        assert!(state.is_showing_idle());
+
+        // 快速连打两键：中间不闪回待机图
+        state.on_key(None, &rules, &mut rng, 1.0);
+        state.on_key_up(None, 1.1);
+        state.on_key(None, &rules, &mut rng, 1.2);
+        // 第二次按下后当前是反应图，去抖期内不回待机
+        assert!(!state.is_showing_idle());
+        assert!(state.tick(1.35).is_empty()); // 1.35 < 1.2+0.2
+        state.on_key_up(None, 1.3);
+        // 1.3 + 0.2 = 1.5 之后才回待机
+        assert!(state.tick(1.4).is_empty());
+        assert_eq!(
+            state.tick(1.51),
+            vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
+        );
     }
 
     #[test]
@@ -345,11 +402,10 @@ mod tests {
         state.on_key_up(Some(stroke), 11.5);
         assert!(state.tick(12.0).is_empty());
 
-        // 抬起最后一个键：开始计时，0.75s 后回待机
+        // 抬起最后一个键：这是一次长达 12s 的长按，松开后立即回待机
         state.on_key_up(Some(other), 12.0);
-        assert!(state.tick(12.7).is_empty());
         assert_eq!(
-            state.tick(12.76),
+            state.tick(12.01),
             vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
         );
         assert!(state.is_showing_idle());

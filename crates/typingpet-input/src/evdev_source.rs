@@ -74,13 +74,14 @@ pub fn spawn_keyboard_listeners(sender: Sender<KeyEvent>) -> Result<usize> {
                             _ => continue,
                         };
 
+                        // 修饰键（Ctrl/Alt/Shift/Super）先更新内部修饰状态，
+                        // 让其它键的 stroke 仍带得上 Ctrl/Alt 等信息；并且本身也作为一次
+                        // 按键上报，这样 Ctrl/Alt 等单独按下/松开也能触发反应，并参与双键和弦。
                         if modifier_bit_for(code).is_some() {
-                            // 修饰键自身也要先更新状态，再决定是否上报
                             crate::update_modifiers(&mut modifiers, code, pressed);
-                            continue;
                         }
 
-                        // 非修饰键：按下与抬起都上报。上层据此判断"键仍被按住"，
+                        // 按下与抬起都上报（修饰键也不例外）。上层据此判断"键仍被按住"，
                         // 长按期间不回待机，抬起后才切回待机图。
                         let key_event = KeyEvent {
                             stroke: typingpet_core::keys::KeyStroke::new(code, modifiers),
