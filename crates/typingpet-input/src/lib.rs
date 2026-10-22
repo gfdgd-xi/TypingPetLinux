@@ -16,12 +16,15 @@ use std::thread;
 use std::time::Duration;
 use typingpet_core::keys::{KeyModifiers, KeyStroke};
 
-/// 一次按键事件（只关心"按下"）。
+/// 一次按键事件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyEvent {
     pub stroke: KeyStroke,
     /// 来自哪个设备（便于日志/排查）
     pub device_index: usize,
+    /// `true` = 按下，`false` = 抬起。抬起事件用于让上层知道"键仍被按住"，
+    /// 从而长按期间不回待机，直到抬起才切换（见 typingpet-core 的 PetState）。
+    pub pressed: bool,
 }
 
 /// 光标位置（X11 root 坐标系：原点左上、y 向下）
@@ -99,12 +102,21 @@ pub fn open_mock(script: Vec<KeyStroke>, interval: Duration) -> InputHandle {
     let count = script.len();
     thread::spawn(move || {
         for (index, stroke) in script.into_iter().enumerate() {
+            // 模拟一次"按下 + 抬起"的轻点，避免上层一直认为键被按住。
             if sender
                 .send(KeyEvent {
                     stroke,
                     device_index: usize::MAX,
+                    pressed: true,
                 })
                 .is_err()
+                || sender
+                    .send(KeyEvent {
+                        stroke,
+                        device_index: usize::MAX,
+                        pressed: false,
+                    })
+                    .is_err()
             {
                 return;
             }

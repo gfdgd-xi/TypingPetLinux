@@ -79,13 +79,13 @@ pub fn spawn_keyboard_listeners(sender: Sender<KeyEvent>) -> Result<usize> {
                             crate::update_modifiers(&mut modifiers, code, pressed);
                             continue;
                         }
-                        if !pressed {
-                            continue;
-                        }
 
+                        // 非修饰键：按下与抬起都上报。上层据此判断"键仍被按住"，
+                        // 长按期间不回待机，抬起后才切回待机图。
                         let key_event = KeyEvent {
                             stroke: typingpet_core::keys::KeyStroke::new(code, modifiers),
                             device_index: index,
+                            pressed,
                         };
                         if sender.send(key_event).is_err() {
                             return;

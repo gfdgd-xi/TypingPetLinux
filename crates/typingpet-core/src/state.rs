@@ -40,6 +40,9 @@ pub struct PetState {
     idle_deadline: Option<f64>,
     shake_amplitude: f64,
     reaction_count: usize,
+    /// 当前被按住（未抬起）的非修饰键数量。>0 时长按期间不回待机，
+    /// 直到全部抬起才开始计时回待机图。
+    held_count: usize,
 }
 
 /// 文件名（stem，大小写不敏感）是否含 "exclamation"。
@@ -68,6 +71,7 @@ impl PetState {
             current_image: None,
             idle_deadline: None,
             shake_amplitude,
+            held_count: 0,
         }
     }
 
@@ -88,6 +92,7 @@ impl PetState {
         self.shake_amplitude = shake_amplitude;
         self.current_image = None;
         self.idle_deadline = None;
+        self.held_count = 0;
     }
 
     pub fn current_image(&self) -> Option<&PathBuf> {
@@ -121,7 +126,10 @@ impl PetState {
         actions
     }
 
-    /// 键输入处理。`stroke` 为 `None` 时表示"测试按钮"，按单键逻辑轮播。
+    /// 键输入处理（按下）。`stroke` 为 `None` 时表示"测试按钮"，按单键逻辑轮播。
+    ///
+    /// 按下时记一个"按住"计数；长按期间 `tick` 会据此抑制回待机，
+    /// 直到所有键抬起（`on_key_up`）才开始计时。
     pub fn on_key(
         &mut self,
         stroke: Option<KeyStroke>,
@@ -141,8 +149,26 @@ impl PetState {
         if self.shake_amplitude > 0.0 {
             actions.push(Action::Bounce(self.shake_amplitude));
         }
+        self.held_count = self.held_count.saturating_add(1);
         self.idle_deadline = Some(now + IDLE_DELAY);
         actions
+    }
+
+    /// 键抬起处理。`stroke` 暂未用于选图，仅用于未来按具体键的精细控制。
+    ///
+    /// 每抬起一个按住的非修饰键，计数减一；当计数归零（最后一个键松开），
+    /// 安排 `IDLE_DELAY` 后回待机图。长按期间不会回待机。
+    pub fn on_key_up(&mut self, _stroke: Option<KeyStroke>, now: f64) -> Vec<Action> {
+        if self.held_count == 0 {
+            return Vec::new();
+        }
+        self.held_count -= 1;
+        if self.held_count > 0 {
+            return Vec::new();
+        }
+        // 最后一个键松开：开始计时回待机
+        self.idle_deadline = Some(now + IDLE_DELAY);
+        Vec::new()
     }
 
     /// 选图：精确规则 > 同时按两键(exclamation) > 单键按顺序轮播。
@@ -188,8 +214,12 @@ impl PetState {
         Some(path)
     }
 
-    /// 定时推进：超时后回待机。
+    /// 定时推进：超时后回待机。长按（仍有键按住）期间不回待机。
     pub fn tick(&mut self, now: f64) -> Vec<Action> {
+        if self.held_count > 0 {
+            // 仍有键按住：保持当前反应图，不回待机
+            return Vec::new();
+        }
         let Some(deadline) = self.idle_deadline else {
             return Vec::new();
         };
@@ -269,16 +299,60 @@ mod tests {
         assert_eq!(actions[1], Action::Bounce(9.0));
         assert!(!state.is_showing_idle());
 
-        // 0.75s 之前不回待机
+        // 键仍按住时（未抬起）不回待机：模拟长按
         assert!(state.tick(100.7).is_empty());
-        // 到点后回待机
+        assert!(state.tick(200.0).is_empty());
+        assert!(!state.is_showing_idle());
+
+        // 抬起后才开始计时回待机
+        state.on_key_up(None, 200.0);
+        assert!(state.tick(200.7).is_empty());
         assert_eq!(
-            state.tick(100.76),
+            state.tick(200.76),
             vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
         );
         assert!(state.is_showing_idle());
         // 已回待机后不再重复
-        assert!(state.tick(101.0).is_empty());
+        assert!(state.tick(201.0).is_empty());
+    }
+
+    #[test]
+    fn hold_keeps_reaction_until_release() {
+        let mut state = state();
+        state.initial_actions();
+        let rules = KeyReactionStore::new("/nonexistent-rules");
+        let mut rng = FixedRng(0);
+        let stroke = KeyStroke::new(37, crate::keys::KeyModifiers::empty());
+
+        // 按下
+        state.on_key(Some(stroke), &rules, &mut rng, 0.0);
+        assert!(!state.is_showing_idle());
+
+        // 长按 10 秒也不回待机
+        for t in [1.0, 5.0, 10.0] {
+            assert!(state.tick(t).is_empty());
+        }
+        assert!(!state.is_showing_idle());
+
+        // 按住期间再按一个新键 → 切换到下一张反应图，仍不回待机
+        let other = KeyStroke::new(38, crate::keys::KeyModifiers::empty());
+        let actions = state.on_key(Some(other), &rules, &mut rng, 10.1);
+        assert!(matches!(actions.first(), Some(Action::ShowImage(_))));
+        assert!(!state.is_showing_idle());
+        assert!(state.tick(11.0).is_empty());
+
+        // 抬起第一个键：仍有一个键按住，继续不回待机
+        state.on_key_up(Some(stroke), 11.5);
+        assert!(state.tick(12.0).is_empty());
+
+        // 抬起最后一个键：开始计时，0.75s 后回待机
+        state.on_key_up(Some(other), 12.0);
+        assert!(state.tick(12.7).is_empty());
+        assert_eq!(
+            state.tick(12.76),
+            vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
+        );
+        assert!(state.is_showing_idle());
     }
 
     #[test]

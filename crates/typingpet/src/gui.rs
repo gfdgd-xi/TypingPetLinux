@@ -1250,13 +1250,21 @@ impl PetUi {
                 }
                 let print_events = ui.runtime.borrow().options.print_events;
                 if print_events {
-                    println!("key: {}", event.stroke.display_name());
+                    println!(
+                        "key: {} {}",
+                        if event.pressed { "down" } else { "up" },
+                        event.stroke.display_name()
+                    );
                 }
                 let actions = {
                     let mut runtime = ui.runtime.borrow_mut();
                     let now = runtime.now();
-                    let crate::Runtime { state, rules, .. } = &mut *runtime;
-                    state.on_key(Some(event.stroke), rules, &mut rng, now)
+                    if event.pressed {
+                        let crate::Runtime { state, rules, .. } = &mut *runtime;
+                        state.on_key(Some(event.stroke), rules, &mut rng, now)
+                    } else {
+                        runtime.state.on_key_up(Some(event.stroke), now)
+                    }
                 };
                 ui.apply_actions(actions);
             }
