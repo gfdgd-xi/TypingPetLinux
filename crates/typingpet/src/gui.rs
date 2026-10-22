@@ -414,19 +414,31 @@ impl PetUi {
         window.present();
 
         // X11 普通窗口：present 之后才能可靠地让窗口管理器接受这些 _NET_WM_STATE。
+        // GTK4 不追踪该状态，窗口管理器重新评估窗口时可能整窗清掉，所以：
+        //   1) 启动时先应用一次；
+        //   2) 之后由下方定时器周期性重申（见后），被清掉也能在 2s 内自愈。
         if !layer_shell {
             if let Some(window_id) = x11_window_id(&window) {
-                // 不在任务栏/分页器显示图标（GTK4 已移除对应属性）
-                if !typingpet_input::x11::set_skip_taskbar(window_id, true) {
-                    eprintln!("X11: 隐藏任务栏图标失败（id=0x{window_id:x}）");
-                }
-                // 若配置里已开启置顶，这里在启动时应用一次（后续由托盘「置顶」实时切换）。
-                if state.borrow().settings.always_on_top
-                    && !typingpet_input::x11::set_above(window_id, true)
-                {
-                    eprintln!("X11: 启动置顶失败（id=0x{window_id:x}）");
+                let above = ui.state.borrow().settings.always_on_top;
+                if !typingpet_input::x11::apply_states(window_id, above) {
+                    eprintln!("X11: 初始化置顶/隐藏任务栏失败（id=0x{window_id:x}）");
                 }
             }
+        }
+
+        // 周期性重申 X11 窗口状态：自愈"置顶丢失 / 任务栏图标回来"的间歇问题。
+        // 仅在非 layer-shell 且窗口可见时生效；Wayland 下 x11_window_id 返回 None，空转无害。
+        {
+            let ui = ui.clone();
+            gtk::glib::timeout_add_seconds_local(2, move || {
+                if ui.window.is_visible() {
+                    if let Some(window_id) = x11_window_id(&ui.window) {
+                        let above = ui.state.borrow().settings.always_on_top;
+                        typingpet_input::x11::apply_states(window_id, above);
+                    }
+                }
+                gtk::glib::ControlFlow::Continue
+            });
         }
 
         // 恢复自检：启动 1 秒后打印窗口状态（含 X11 下的真实位置），
@@ -625,8 +637,9 @@ impl PetUi {
             };
             self.window.set_layer(layer);
         } else if let Some(window_id) = x11_window_id(&self.window) {
-            // X11 普通窗口没有 layer-shell，只能用 _NET_WM_STATE_ABOVE 让窗口管理器置顶
-            if !typingpet_input::x11::set_above(window_id, enabled) {
+            // X11 普通窗口没有 layer-shell，直接用 _NET_WM_STATE 让窗口管理器置顶，
+            // 同时重申跳过任务栏（两者合并发送，避免切换置顶把"隐藏任务栏"带丢）。
+            if !typingpet_input::x11::apply_states(window_id, enabled) {
                 eprintln!("X11: 设置置顶失败（id=0x{window_id:x}）");
             }
         }

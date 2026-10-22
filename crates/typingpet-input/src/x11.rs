@@ -141,6 +141,48 @@ pub fn set_skip_taskbar(window_id: u32, skip: bool) -> bool {
     .is_some()
 }
 
+/// 一次性把窗口的常驻状态设对：始终跳过任务栏/分页器，并按需置顶。
+///
+/// GTK4 不追踪 `_NET_WM_STATE`（相关类型化方法已移除），窗口管理器在重新评估窗口时
+/// 可能把整窗口状态清掉，于是"置顶丢了、任务栏图标又回来"会间歇性出现。把多个变更
+/// 合并到同一次连接里发送，并且由调用方周期性重申（见 gui.rs），即可自愈。
+pub fn apply_states(window_id: u32, above: bool) -> bool {
+    with_connection(|connection, _screen_number| -> Option<()> {
+        let net_wm_state = intern_atom(connection, b"_NET_WM_STATE")?;
+        let skip_taskbar = intern_atom(connection, b"_NET_WM_STATE_SKIP_TASKBAR")?;
+        let skip_pager = intern_atom(connection, b"_NET_WM_STATE_SKIP_PAGER")?;
+        let above_atom = intern_atom(connection, b"_NET_WM_STATE_ABOVE")?;
+
+        let mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
+
+        // 1) 始终跳过任务栏/分页器（先确保，避免置顶切换把它带丢）
+        let skip_data = [1, skip_taskbar, skip_pager, 0, 0];
+        connection
+            .send_event(
+                true,
+                window_id,
+                mask,
+                ClientMessageEvent::new(32, window_id, net_wm_state, skip_data),
+            )
+            .ok()?;
+
+        // 2) 置顶/取消置顶（动作 1=ADD, 0=REMOVE）
+        let above_data = [if above { 1 } else { 0 }, above_atom, 0, 0, 0];
+        connection
+            .send_event(
+                true,
+                window_id,
+                mask,
+                ClientMessageEvent::new(32, window_id, net_wm_state, above_data),
+            )
+            .ok()?;
+
+        connection.flush().ok()?;
+        Some(())
+    })
+    .is_some()
+}
+
 /// 取已 intern 的原子；失败返回 `None`。
 fn intern_atom(connection: &RustConnection, name: &[u8]) -> Option<Atom> {
     connection
