@@ -65,12 +65,19 @@ fn main() {
                 }
                 if let Some(event) = handle.recv_timeout(Duration::from_millis(200)) {
                     count += 1;
-                    println!(
-                        "[{count:>3}] code={:<4} {:<20} (device #{})",
-                        event.stroke.code,
-                        event.stroke.display_name(),
-                        event.device_index
-                    );
+                    match event {
+                        typingpet_input::InputEvent::Key(key) => println!(
+                            "[{count:>3}] key   code={:<4} {:<20} (device #{})",
+                            key.stroke.code,
+                            key.stroke.display_name(),
+                            key.device_index
+                        ),
+                        typingpet_input::InputEvent::Mouse(mouse) => println!(
+                            "[{count:>3}] mouse {} {:?}",
+                            if mouse.pressed { "down" } else { "up" },
+                            mouse.button
+                        ),
+                    }
                 }
             }
             println!("total: {count} keystroke(s)");

@@ -330,15 +330,37 @@ fn run_headless(options: Options) -> Result<()> {
             }
         }
         if let Some(event) = runtime.input.recv_timeout(Duration::from_millis(50)) {
-            if runtime.options.print_events {
-                println!("  key: {}", event.stroke.display_name());
-            }
-            idle_printed = false;
-            let actions = runtime
-                .state
-                .on_key(Some(event.stroke), &runtime.rules, &mut rng, runtime.now());
-            for action in actions {
-                print_action(&action, "key");
+            match event {
+                typingpet_input::InputEvent::Key(key) => {
+                    if runtime.options.print_events {
+                        println!("  key: {}", key.stroke.display_name());
+                    }
+                    idle_printed = false;
+                    let actions = runtime
+                        .state
+                        .on_key(Some(key.stroke), &runtime.rules, &mut rng, runtime.now());
+                    for action in actions {
+                        print_action(&action, "key");
+                    }
+                }
+                typingpet_input::InputEvent::Mouse(mouse) => {
+                    if runtime.options.print_events {
+                        println!(
+                            "  mouse: {:?} {}",
+                            mouse.button,
+                            if mouse.pressed { "down" } else { "up" }
+                        );
+                    }
+                    idle_printed = false;
+                    let actions = if mouse.pressed {
+                        runtime.state.on_mouse_down(mouse.button, runtime.now())
+                    } else {
+                        runtime.state.on_mouse_up(mouse.button, runtime.now())
+                    };
+                    for action in actions {
+                        print_action(&action, "mouse");
+                    }
+                }
             }
         }
 

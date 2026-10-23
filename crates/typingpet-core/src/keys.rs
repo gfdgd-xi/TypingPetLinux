@@ -83,6 +83,28 @@ impl KeyStroke {
     }
 }
 
+/// 鼠标按键。用于"按鼠标触发特定动作"的特性。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+    /// 其它按键（如侧键），用 evdev 的 `BTN_*` 原始键码标识。
+    Other(u32),
+}
+
+impl MouseButton {
+    /// 由 evdev 的 `BTN_*` 键码构造。
+    pub fn from_evdev(code: u32) -> Self {
+        match code {
+            272 => MouseButton::Left,   // BTN_LEFT
+            273 => MouseButton::Right,  // BTN_RIGHT
+            274 => MouseButton::Middle, // BTN_MIDDLE
+            other => MouseButton::Other(other),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyReactionRule {
     pub id: String,

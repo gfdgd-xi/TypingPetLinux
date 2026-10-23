@@ -14,7 +14,7 @@ pub mod x11;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
-use typingpet_core::keys::{KeyModifiers, KeyStroke};
+use typingpet_core::keys::{KeyModifiers, KeyStroke, MouseButton};
 
 /// 一次按键事件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +25,21 @@ pub struct KeyEvent {
     /// `true` = 按下，`false` = 抬起。抬起事件用于让上层知道"键仍被按住"，
     /// 从而长按期间不回待机，直到抬起才切换（见 typingpet-core 的 PetState）。
     pub pressed: bool,
+}
+
+/// 一次鼠标按键事件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub button: MouseButton,
+    /// `true` = 按下，`false` = 抬起。抬起后上层切回待机图。
+    pub pressed: bool,
+}
+
+/// 统一的输入事件：键盘或鼠标，经同一 channel 投递（见 gui 的事件分发）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEvent {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
 }
 
 /// 光标位置（X11 root 坐标系：原点左上、y 向下）
@@ -58,7 +73,7 @@ impl Backend {
 
 /// 运行中的输入源：一个后台线程 + 一个 channel。
 pub struct InputHandle {
-    receiver: Receiver<KeyEvent>,
+    receiver: Receiver<InputEvent>,
     backend: Backend,
     description: String,
 }
@@ -72,11 +87,11 @@ impl InputHandle {
         &self.description
     }
 
-    pub fn try_recv(&self) -> Option<KeyEvent> {
+    pub fn try_recv(&self) -> Option<InputEvent> {
         self.receiver.try_recv().ok()
     }
 
-    pub fn recv_timeout(&self, timeout: Duration) -> Option<KeyEvent> {
+    pub fn recv_timeout(&self, timeout: Duration) -> Option<InputEvent> {
         match self.receiver.recv_timeout(timeout) {
             Ok(event) => Some(event),
             Err(RecvTimeoutError::Timeout) => None,
@@ -85,14 +100,16 @@ impl InputHandle {
     }
 }
 
-/// 打开 evdev 全局键盘监听；没有任何可用键盘设备时返回错误（调用方可降级）。
+/// 打开 evdev 全局键盘+鼠标监听；没有任何可用键盘设备时返回错误（调用方可降级）。
 pub fn open_evdev() -> anyhow::Result<InputHandle> {
     let (sender, receiver) = mpsc::channel();
-    let devices = evdev_source::spawn_keyboard_listeners(sender)?;
+    let devices = evdev_source::spawn_keyboard_listeners(sender.clone())?;
+    // 鼠标监听失败不致命：没有权限/设备时键盘仍可正常工作。
+    let mice = evdev_source::spawn_mouse_listeners(sender).unwrap_or(0);
     Ok(InputHandle {
         receiver,
         backend: Backend::Evdev,
-        description: format!("evdev: {} keyboard device(s)", devices),
+        description: format!("evdev: {devices} keyboard device(s), {mice} mouse device(s)"),
     })
 }
 
@@ -104,18 +121,18 @@ pub fn open_mock(script: Vec<KeyStroke>, interval: Duration) -> InputHandle {
         for (index, stroke) in script.into_iter().enumerate() {
             // 模拟一次"按下 + 抬起"的轻点，避免上层一直认为键被按住。
             if sender
-                .send(KeyEvent {
+                .send(InputEvent::Key(KeyEvent {
                     stroke,
                     device_index: usize::MAX,
                     pressed: true,
-                })
+                }))
                 .is_err()
                 || sender
-                    .send(KeyEvent {
+                    .send(InputEvent::Key(KeyEvent {
                         stroke,
                         device_index: usize::MAX,
                         pressed: false,
-                    })
+                    }))
                     .is_err()
             {
                 return;
@@ -235,10 +252,15 @@ mod tests {
             ],
             Duration::from_millis(1),
         );
-        let first = handle.recv_timeout(Duration::from_secs(1)).expect("first");
-        assert_eq!(first.stroke.code, 37);
-        let second = handle.recv_timeout(Duration::from_secs(1)).expect("second");
-        assert_eq!(second.stroke.code, 38);
+        // mock 每个键都会发"按下+抬起"，按脚本顺序回放，收集到的键码应包含 37 与 38
+        let mut codes = Vec::new();
+        while let Some(event) = handle.recv_timeout(Duration::from_secs(1)) {
+            if let InputEvent::Key(key) = event {
+                codes.push(key.stroke.code);
+            }
+        }
+        assert!(codes.contains(&37));
+        assert!(codes.contains(&38));
         assert_eq!(handle.backend(), Backend::Mock);
     }
 }

@@ -1236,7 +1236,7 @@ impl PetUi {
             }
 
             // 1) 输入 → 状态机（捕获窗口优先消费）
-            let events: Vec<typingpet_input::KeyEvent> = {
+            let events: Vec<typingpet_input::InputEvent> = {
                 let runtime = ui.runtime.borrow();
                 let mut events = Vec::new();
                 while let Some(event) = runtime.input.try_recv() {
@@ -1245,28 +1245,51 @@ impl PetUi {
                 events
             };
             for event in events {
-                if ui.handle_capture(event.stroke) {
-                    continue;
-                }
                 let print_events = ui.runtime.borrow().options.print_events;
-                if print_events {
-                    println!(
-                        "key: {} {}",
-                        if event.pressed { "down" } else { "up" },
-                        event.stroke.display_name()
-                    );
-                }
-                let actions = {
-                    let mut runtime = ui.runtime.borrow_mut();
-                    let now = runtime.now();
-                    if event.pressed {
-                        let crate::Runtime { state, rules, .. } = &mut *runtime;
-                        state.on_key(Some(event.stroke), rules, &mut rng, now)
-                    } else {
-                        runtime.state.on_key_up(Some(event.stroke), now)
+                match event {
+                    typingpet_input::InputEvent::Key(key) => {
+                        if ui.handle_capture(key.stroke) {
+                            continue;
+                        }
+                        if print_events {
+                            println!(
+                                "key: {} {}",
+                                if key.pressed { "down" } else { "up" },
+                                key.stroke.display_name()
+                            );
+                        }
+                        let actions = {
+                            let mut runtime = ui.runtime.borrow_mut();
+                            let now = runtime.now();
+                            if key.pressed {
+                                let crate::Runtime { state, rules, .. } = &mut *runtime;
+                                state.on_key(Some(key.stroke), rules, &mut rng, now)
+                            } else {
+                                runtime.state.on_key_up(Some(key.stroke), now)
+                            }
+                        };
+                        ui.apply_actions(actions);
                     }
-                };
-                ui.apply_actions(actions);
+                    typingpet_input::InputEvent::Mouse(mouse) => {
+                        if print_events {
+                            println!(
+                                "mouse: {} {:?}",
+                                if mouse.pressed { "down" } else { "up" },
+                                mouse.button
+                            );
+                        }
+                        let actions = {
+                            let mut runtime = ui.runtime.borrow_mut();
+                            let now = runtime.now();
+                            if mouse.pressed {
+                                runtime.state.on_mouse_down(mouse.button, now)
+                            } else {
+                                runtime.state.on_mouse_up(mouse.button, now)
+                            }
+                        };
+                        ui.apply_actions(actions);
+                    }
+                }
             }
 
             // 2) 待机超时

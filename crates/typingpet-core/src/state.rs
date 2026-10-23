@@ -41,6 +41,8 @@ pub struct PetState {
     sequence_urls: Vec<PathBuf>,
     /// 文件名含 "exclamation" 的图，仅在同时按两个键时显示。
     exclamation_url: Option<PathBuf>,
+    /// 文件名含 "mousepress" 的图，按下鼠标时显示，松开鼠标切回待机。
+    mousepress_url: Option<PathBuf>,
     /// 轮播池当前下标（每次单键按下前进一位）。
     sequence_index: usize,
     /// 上一次按下事件：键码 + 时间戳，用于"同时按两键"判定。
@@ -54,6 +56,9 @@ pub struct PetState {
     held_count: usize,
     /// 从"无键按住"进入"有键按住"的时刻，用于区分长按/短按。
     held_since: Option<f64>,
+    /// 当前被按住的鼠标按键数量。>0 时显示 mousepress 且长按期间不回待机，
+    /// 直到全部抬起才切回待机图。
+    mouse_held: usize,
 }
 
 /// 文件名（stem，大小写不敏感）是否含 "exclamation"。
@@ -64,19 +69,28 @@ fn is_exclamation(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 文件名（stem，大小写不敏感）是否含 "mousepress"。
+fn is_mousepress(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.to_lowercase().contains("mousepress"))
+        .unwrap_or(false)
+}
+
 impl PetState {
     pub fn new(
         idle_url: Option<PathBuf>,
         reaction_urls: Vec<PathBuf>,
         shake_amplitude: f64,
     ) -> Self {
-        let (sequence_urls, exclamation_url) = split_reactions(&reaction_urls);
+        let (sequence_urls, exclamation_url, mousepress_url) = split_reactions(&reaction_urls);
         Self {
             reaction_count: reaction_urls.len(),
             idle_url,
             reaction_urls,
             sequence_urls,
             exclamation_url,
+            mousepress_url,
             sequence_index: 0,
             last_press: None,
             current_image: None,
@@ -84,6 +98,7 @@ impl PetState {
             shake_amplitude,
             held_count: 0,
             held_since: None,
+            mouse_held: 0,
         }
     }
 
@@ -93,12 +108,13 @@ impl PetState {
         reaction_urls: Vec<PathBuf>,
         shake_amplitude: f64,
     ) {
-        let (sequence_urls, exclamation_url) = split_reactions(&reaction_urls);
+        let (sequence_urls, exclamation_url, mousepress_url) = split_reactions(&reaction_urls);
         self.reaction_count = reaction_urls.len();
         self.idle_url = idle_url;
         self.reaction_urls = reaction_urls;
         self.sequence_urls = sequence_urls;
         self.exclamation_url = exclamation_url;
+        self.mousepress_url = mousepress_url;
         self.sequence_index = 0;
         self.last_press = None;
         self.shake_amplitude = shake_amplitude;
@@ -106,6 +122,7 @@ impl PetState {
         self.idle_deadline = None;
         self.held_count = 0;
         self.held_since = None;
+        self.mouse_held = 0;
     }
 
     pub fn current_image(&self) -> Option<&PathBuf> {
@@ -195,6 +212,49 @@ impl PetState {
         Vec::new()
     }
 
+    /// 鼠标按下：若图集含 `mousepress` 图，切换到该图并弹跳；否则无操作。
+    ///
+    /// 按住期间保持该图（与键盘长按一样不会回待机），直到 `on_mouse_up` 切回待机。
+    pub fn on_mouse_down(
+        &mut self,
+        _button: crate::keys::MouseButton,
+        _now: f64,
+    ) -> Vec<Action> {
+        let Some(url) = self.mousepress_url.clone() else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        self.current_image = Some(url.clone());
+        actions.push(Action::ShowImage(url));
+        if self.shake_amplitude > 0.0 {
+            actions.push(Action::Bounce(self.shake_amplitude));
+        }
+        self.mouse_held = self.mouse_held.saturating_add(1);
+        // 鼠标按住期间不回待机：清掉待机截止时间，交给 tick 的 mouse_held 守卫。
+        self.idle_deadline = None;
+        actions
+    }
+
+    /// 鼠标抬起：计数减一；最后一个鼠标键松开且没有任何键按住时，立即切回待机图。
+    pub fn on_mouse_up(
+        &mut self,
+        _button: crate::keys::MouseButton,
+        now: f64,
+    ) -> Vec<Action> {
+        if self.mouse_held == 0 {
+            return Vec::new();
+        }
+        self.mouse_held -= 1;
+        if self.mouse_held > 0 {
+            return Vec::new();
+        }
+        // 鼠标松开且键盘也没有键按住 → 立即回待机（"松开鼠标则变回 idle"）。
+        if self.held_count == 0 {
+            self.idle_deadline = Some(now);
+        }
+        Vec::new()
+    }
+
     /// 选图：精确规则 > 同时按 >=2 键(exclamation) > 单键按顺序轮播。
     fn choose_image(
         &mut self,
@@ -242,8 +302,8 @@ impl PetState {
 
     /// 定时推进：超时后回待机。长按（仍有键按住）期间不回待机。
     pub fn tick(&mut self, now: f64) -> Vec<Action> {
-        if self.held_count > 0 {
-            // 仍有键按住：保持当前反应图，不回待机
+        if self.held_count > 0 || self.mouse_held > 0 {
+            // 仍有键或鼠标按住：保持当前反应图，不回待机
             return Vec::new();
         }
         let Some(deadline) = self.idle_deadline else {
@@ -265,9 +325,10 @@ impl PetState {
     }
 }
 
-/// 把反应图拆成"轮播池"与"exclamation（双键）"。
-fn split_reactions(urls: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>) {
+/// 把反应图拆成"轮播池"、"exclamation（双键）"与"mousepress（鼠标按下）"。
+fn split_reactions(urls: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
     let mut exclamation: Option<PathBuf> = None;
+    let mut mousepress: Option<PathBuf> = None;
     let sequence: Vec<PathBuf> = urls
         .iter()
         .filter(|path| {
@@ -276,13 +337,18 @@ fn split_reactions(urls: &[PathBuf]) -> (Vec<PathBuf>, Option<PathBuf>) {
                     exclamation = Some((*path).clone());
                 }
                 false
+            } else if is_mousepress(path) {
+                if mousepress.is_none() {
+                    mousepress = Some((*path).clone());
+                }
+                false
             } else {
                 true
             }
         })
         .cloned()
         .collect();
-    (sequence, exclamation)
+    (sequence, exclamation, mousepress)
 }
 
 #[cfg(test)]
@@ -561,5 +627,44 @@ mod tests {
             actions[0],
             Action::ShowImage(PathBuf::from("/img/pet-right.png"))
         );
+    }
+
+    #[test]
+    fn mouse_press_shows_mousepress_and_release_returns_idle() {
+        let mut state = PetState::new(
+            Some(PathBuf::from("/img/pet-idle.png")),
+            vec![
+                PathBuf::from("/img/pet-left.png"),
+                PathBuf::from("/img/pet-right.png"),
+                PathBuf::from("/img/pet-mousepress.png"),
+            ],
+            9.0,
+        );
+        state.initial_actions();
+
+        // 鼠标按下（集内含 pet-mousepress）→ 显示 mousepress
+        let actions = state.on_mouse_down(crate::keys::MouseButton::Left, 1.0);
+        assert_eq!(
+            actions[0],
+            Action::ShowImage(PathBuf::from("/img/pet-mousepress.png"))
+        );
+        // 鼠标按住期间不回待机
+        assert!(state.tick(1.5).is_empty());
+        assert!(!state.is_showing_idle());
+
+        // 松开鼠标 → 立即回待机
+        state.on_mouse_up(crate::keys::MouseButton::Left, 2.0);
+        assert_eq!(
+            state.tick(2.01),
+            vec![Action::ShowImage(PathBuf::from("/img/pet-idle.png"))]
+        );
+        assert!(state.is_showing_idle());
+    }
+
+    #[test]
+    fn mouse_press_without_mousepress_image_is_noop() {
+        let mut state = state(); // 集内不含 mousepress 图
+        let actions = state.on_mouse_down(crate::keys::MouseButton::Left, 1.0);
+        assert!(actions.is_empty());
     }
 }

@@ -3,7 +3,7 @@
 //! 每个可用键盘设备一个读取线程，全部投递到同一个 channel。
 //! 只读取 `EV_KEY` 的按下/抬起，不读取 `EV_MSC`（扫描码）或任何字符输入，也不落盘。
 
-use crate::{modifier_bit_for, KeyEvent};
+use crate::{modifier_bit_for, InputEvent, KeyEvent, MouseEvent};
 use anyhow::{anyhow, Context, Result};
 use evdev::{Device, EventType, KeyCode};
 use std::path::PathBuf;
@@ -23,8 +23,16 @@ fn looks_like_keyboard(device: &Device) -> bool {
     }
 }
 
+/// 候选鼠标设备：支持鼠标主键（BTN_LEFT）。
+fn looks_like_mouse(device: &Device) -> bool {
+    match device.supported_keys() {
+        Some(keys) => keys.contains(KeyCode::BTN_LEFT),
+        None => false,
+    }
+}
+
 /// 枚举键盘设备并为每个设备启动读取线程，返回启动的设备数量。
-pub fn spawn_keyboard_listeners(sender: Sender<KeyEvent>) -> Result<usize> {
+pub fn spawn_keyboard_listeners(sender: Sender<InputEvent>) -> Result<usize> {
     let mut started = 0usize;
     let mut errors: Vec<String> = Vec::new();
 
@@ -88,7 +96,7 @@ pub fn spawn_keyboard_listeners(sender: Sender<KeyEvent>) -> Result<usize> {
                             device_index: index,
                             pressed,
                         };
-                        if sender.send(key_event).is_err() {
+                        if sender.send(InputEvent::Key(key_event)).is_err() {
                             return;
                         }
                     }
@@ -106,6 +114,66 @@ pub fn spawn_keyboard_listeners(sender: Sender<KeyEvent>) -> Result<usize> {
             errors.join("; ")
         };
         return Err(anyhow!(detail));
+    }
+    Ok(started)
+}
+
+/// 枚举鼠标设备并为每个设备启动读取线程，返回启动的设备数量。
+///
+/// 鼠标监听失败（无权限/无设备）不致命，调用方用 `unwrap_or(0)` 忽略即可。
+pub fn spawn_mouse_listeners(sender: Sender<InputEvent>) -> Result<usize> {
+    let mut started = 0usize;
+    for (index, (path, device)) in evdev::enumerate().enumerate() {
+        if !looks_like_mouse(&device) {
+            continue;
+        }
+        let device_path: PathBuf = path;
+        let mut device = match Device::open(&device_path) {
+            Ok(device) => device,
+            Err(_) => continue,
+        };
+        if device.set_nonblocking(false).is_err() {
+            continue;
+        }
+
+        let sender = sender.clone();
+        let thread_path = device_path.clone();
+        thread::Builder::new()
+            .name(format!("typingpet-mouse-{index}"))
+            .spawn(move || {
+                loop {
+                    let events = match device.fetch_events() {
+                        Ok(events) => events,
+                        Err(error) => {
+                            eprintln!(
+                                "[typingpet] mouse device {} read error: {error}",
+                                thread_path.display()
+                            );
+                            return;
+                        }
+                    };
+                    for event in events {
+                        if event.event_type() != EventType::KEY {
+                            continue;
+                        }
+                        let code = u32::from(event.code());
+                        let pressed = match event.value() {
+                            0 => false,
+                            1 => true,
+                            _ => continue, // 自动重复忽略
+                        };
+                        let mouse_event = MouseEvent {
+                            button: typingpet_core::keys::MouseButton::from_evdev(code),
+                            pressed,
+                        };
+                        if sender.send(InputEvent::Mouse(mouse_event)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .with_context(|| format!("spawn mouse reader for {}", device_path.display()))?;
+        started += 1;
     }
     Ok(started)
 }
